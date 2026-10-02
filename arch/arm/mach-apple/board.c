@@ -3,6 +3,8 @@
  * (C) Copyright 2021 Mark Kettenis <kettenis@openbsd.org>
  */
 
+#include <bootm.h>
+#include <console.h>
 #include <dm.h>
 #include <dm/uclass-internal.h>
 #include <command.h>
@@ -11,12 +13,14 @@
 #include <lmb.h>
 #include <nvme.h>
 #include <part.h>
+#include <usb.h>
 #include <linux/ioport.h>
 #include <linux/stringify.h>
 
 #include <asm/armv8/mmu.h>
 #include <asm/global_data.h>
 #include <asm/io.h>
+#include <asm/arch/rtkit.h>
 #include <asm/system.h>
 
 DECLARE_GLOBAL_DATA_PTR;
@@ -976,6 +980,20 @@ char *env_fat_get_dev_part(void)
 
 #define lmb_alloc(size, addr) lmb_alloc_mem(LMB_MEM_ALLOC_ANY, SZ_2M, addr, size, LMB_NONE)
 
+void board_quiesce_devices(void)
+{
+	/*
+	 * The J700 menu may have started USB for EFI console input. Stop the
+	 * buses before generic OS-prepare removal shuts down their ATC reset
+	 * providers. xhci-dwc3 is not itself marked for OS-prepare removal.
+	 * This is also used by the named direct Linux fallback.
+	 */
+	if (IS_ENABLED(CONFIG_USB) && of_machine_is_compatible("apple,t8140")) {
+		if (usb_stop())
+			printf("J700: USB shutdown failed before OS handoff\n");
+	}
+}
+
 /*
  * Aurora Silicon boot flow for the MacBook Neo (A18 Pro, T8140).
  *
@@ -1042,6 +1060,17 @@ static void t8140_late_init(void)
 	const char *str;
 	ofnode chosen;
 	int i;
+
+	/* global_data's console members exist only with CONSOLE_RECORD. */
+#ifdef CONFIG_CONSOLE_RECORD
+	/* Private bring-up console output only; no input/keycode tracing. */
+	if (IS_ENABLED(CONFIG_CONSOLE_RECORD) && gd->console_out.start) {
+		console_record_reset_enable();
+		memset(gd->console_out.start, 0,
+		       gd->console_out.end - gd->console_out.start);
+		printf("Neo MTP bootloader diagnostic console\n");
+	}
+#endif
 
 	for (i = 0; i < ARRAY_SIZE(t8140_env); i++) {
 		if (!env_get(t8140_env[i][0]))
@@ -1123,6 +1152,51 @@ int ft_board_setup(void *blob, struct bd_info *bd)
 	struct udevice *dev;
 	const char *stdoutname;
 	int node, ret;
+
+	/* global_data's console members exist only with CONSOLE_RECORD. */
+#ifdef CONFIG_CONSOLE_RECORD
+	/* Reserve the live console buffer so Linux can collect late teardown. */
+	if (IS_ENABLED(CONFIG_CONSOLE_RECORD) && gd->console_out.start &&
+	    of_machine_is_compatible("apple,t8140")) {
+		u64 addr = (ulong)gd->console_out.start;
+		u64 size = gd->console_out.end - gd->console_out.start;
+		u64 base = ALIGN_DOWN(addr, SZ_16K);
+		fdt64_t range[2] = { cpu_to_fdt64(addr), cpu_to_fdt64(size) };
+
+		if (size != CONFIG_CONSOLE_RECORD_OUT_SIZE)
+			return -EINVAL;
+		ret = fdt_add_mem_rsv(blob, base, ALIGN(addr + size - base, SZ_16K));
+		if (ret)
+			return ret;
+		node = fdt_path_offset(blob, "/chosen");
+		if (node < 0)
+			return node;
+		ret = fdt_setprop(blob, node, "nixos-neo,uboot-console",
+				  range, sizeof(range));
+		if (ret)
+			return ret;
+	}
+#endif
+
+	if (IS_ENABLED(CONFIG_APPLE_MTP_KEYB) &&
+	    of_machine_is_compatible("apple,t8140")) {
+		ofnode helper = ofnode_by_compatible(ofnode_null(),
+						    "apple,t8140-rtk-helper-asc4");
+		ofnode keyboard = ofnode_by_compatible(ofnode_null(), "apple,dockchannel-hid");
+
+		ret = uclass_find_device_by_ofnode(UCLASS_KEYBOARD, keyboard, &dev);
+		if (ret || !device_active(dev))
+			return -ENODEV;
+		ret = apple_mtp_kbd_fixup(dev, blob);
+		if (ret)
+			return ret;
+		ret = uclass_find_device_by_ofnode(UCLASS_MISC, helper, &dev);
+		if (ret || !device_active(dev))
+			return -ENODEV;
+		ret = apple_rtkit_helper_fixup(dev, blob);
+		if (ret)
+			return ret;
+	}
 
 	/*
 	 * Modify the "stdout-path" property under "/chosen" to point

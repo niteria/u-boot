@@ -78,10 +78,11 @@ config APPLE_MTP_KEYB
 	  Apple-specific HID-over-DockChannel protocol.
 
 	  On T8140 (A18 Pro), this enables the internal keyboard in U-Boot
-	  and EFI applications such as GRUB. Linux handover remains unsolved:
-	  after U-Boot starts MTP, Linux cannot reliably restart it and loses
-	  the internal keyboard and trackpad. To boot Linux after using this
-	  option, reset and boot an image with this option disabled.
+	  and EFI applications such as GRUB or systemd-boot. T8140 handover
+	  requires a matched OS supporting the experimental live-session ABI 2;
+	  legacy kernels cannot restart the retained session. This option stays
+	  disabled by default. See doc/board/apple/j700-mtp.rst for the build
+	  configuration, receiver requirements and hardware qualification.
 
 config CROS_EC_KEYB
 	bool "Enable Chrome OS EC keyboard support"
