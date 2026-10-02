@@ -11,6 +11,7 @@
 #include <keyboard.h>
 #include <stdio_dev.h>
 #include <iomux.h>
+#include <fdt_support.h>
 #include <asm/arch/rtkit.h>
 #include <asm/io.h>
 #include <asm/unaligned.h>
@@ -40,6 +41,7 @@ struct apple_mtp_kbd_priv {
 	u8 tx_seq;
 	u8 *pkt;
 	bool ready;
+	u32 poll_count, report_count, accepted_count;
 };
 
 /*
@@ -290,8 +292,12 @@ static int apple_mtp_kbd_check_announce(struct input_config *input,
 	if (!priv->helper || hdr->iface != priv->kbd_iface)
 		return 0;
 
-	return apple_kbd_handle_report(input, &priv->kbd,
-				       priv->pkt + sizeof(*sub), plen);
+	priv->report_count++;
+	ret = apple_kbd_handle_report(input, &priv->kbd,
+				      priv->pkt + sizeof(*sub), plen);
+	if (ret > 0)
+		priv->accepted_count++;
+	return ret;
 }
 
 static int apple_mtp_kbd_check(struct input_config *input)
@@ -302,6 +308,7 @@ static int apple_mtp_kbd_check(struct input_config *input)
 	u32 pending;
 	int ret;
 
+	priv->poll_count++;
 	/* Poll for syslogs if RTKit is up */
 	if (priv->helper)
 		apple_rtkit_helper_poll(priv->helper, 0);
@@ -460,12 +467,18 @@ static int apple_mtp_kbd_probe(struct udevice *dev)
 	return input_stdio_register(sdev);
 }
 
+#include "apple_mtp_handoff.h"
+
 static int apple_mtp_kbd_remove(struct udevice *dev)
 {
 	struct apple_mtp_kbd_priv *priv = dev_get_priv(dev);
 	struct keyboard_priv *uc_priv = dev_get_uclass_priv(dev);
 	struct input_config *input = &uc_priv->input;
 	int i, ret;
+
+	if (priv->helper && device_is_compatible(priv->helper,
+						 "apple,t8140-rtk-helper-asc4"))
+		return apple_mtp_kbd_handoff(dev);
 
 	if (priv->helper) {
 		ret = device_remove(priv->helper, DM_REMOVE_NORMAL);
@@ -640,6 +653,8 @@ static int do_mtpkbd(struct cmd_tbl *cmdtp, int flag, int argc,
 		printf("mtpkbd: cannot update stdin (%d)\n", ret);
 		return CMD_RET_FAILURE;
 	}
+	printf("mtpkbd: active console inputs: ");
+	iomux_printdevs(stdin);
 
 	return CMD_RET_SUCCESS;
 }

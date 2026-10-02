@@ -6,6 +6,7 @@
 
 #include <mailbox.h>
 #include <malloc.h>
+#include <time.h>
 
 #include <asm/arch/rtkit.h>
 #include <linux/apple-mailbox.h>
@@ -434,6 +435,25 @@ wait_epmap:
 	return 0;
 }
 
+/* A stream of log messages must not extend a power transition indefinitely. */
+static int rtkit_wait_power(struct apple_rtkit *rtk, const int *state, int want)
+{
+	ulong start = get_timer(0);
+	int ret;
+
+	while (*state != want) {
+		ulong elapsed = get_timer(start);
+
+		if (elapsed >= 1000)
+			return -ETIMEDOUT;
+		ret = apple_rtkit_poll(rtk, (1000 - elapsed) * 1000);
+		if (ret < 0)
+			return ret;
+	}
+
+	return 0;
+}
+
 int apple_rtkit_set_ap_power(struct apple_rtkit *rtk, int pwrstate)
 {
 	struct apple_mbox_msg msg;
@@ -449,13 +469,7 @@ int apple_rtkit_set_ap_power(struct apple_rtkit *rtk, int pwrstate)
 	if (ret < 0)
 		return ret;
 
-	while (rtk->ap_pwr != pwrstate) {
-		ret = apple_rtkit_poll(rtk, TIMEOUT_1SEC_US);
-		if (ret < 0)
-			return ret;
-	}
-
-	return 0;
+	return rtkit_wait_power(rtk, &rtk->ap_pwr, pwrstate);
 }
 
 int apple_rtkit_shutdown(struct apple_rtkit *rtk, int pwrstate)
@@ -476,11 +490,5 @@ int apple_rtkit_shutdown(struct apple_rtkit *rtk, int pwrstate)
 	if (ret < 0)
 		return ret;
 
-	while (rtk->iop_pwr != pwrstate) {
-		ret = apple_rtkit_poll(rtk, TIMEOUT_1SEC_US);
-		if (ret < 0)
-			return ret;
-	}
-
-	return 0;
+	return rtkit_wait_power(rtk, &rtk->iop_pwr, pwrstate);
 }

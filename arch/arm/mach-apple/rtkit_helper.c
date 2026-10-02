@@ -7,6 +7,7 @@
 #include <dm/device_compat.h>
 #include <cpu_func.h>
 #include <lmb.h>
+#include <fdt_support.h>
 #include <mailbox.h>
 #include <mapmem.h>
 #include <reset.h>
@@ -33,6 +34,8 @@ struct rtkit_helper_priv {
 	 * so they must lie inside the window the coprocessor can address.
 	 */
 	u64 dma_start, dma_end;
+	u64 handoff[4][2];
+	bool retain_buffers;
 };
 
 static bool rtkit_helper_uses_dram(struct udevice *dev)
@@ -40,6 +43,8 @@ static bool rtkit_helper_uses_dram(struct udevice *dev)
 	return IS_ENABLED(CONFIG_APPLE_MTP_KEYB) &&
 	       device_is_compatible(dev, "apple,t8140-rtk-helper-asc4");
 }
+
+#include "rtkit_mtp_adopt.h"
 
 static void rtkit_helper_read_dma_window(struct udevice *dev)
 {
@@ -84,6 +89,10 @@ static int shmem_setup(void *cookie, struct apple_rtkit_buffer *buf) {
 	fdt_size_t sram_size;
 	fdt_addr_t sram;
 
+	if (rtkit_helper_uses_dram(dev))
+		printf("MTP RTKit: endpoint %d buffer %#llx size %#zx mapped %d\n",
+		       buf->endpoint, buf->dva, buf->size, buf->is_mapped);
+
 	if (!buf->is_mapped) {
 		/* Older MTP firmware retains OSLog in SRAM across OS handoff. */
 		if (buf->endpoint == APPLE_RTKIT_EP_OSLOG &&
@@ -113,6 +122,7 @@ static int shmem_setup(void *cookie, struct apple_rtkit_buffer *buf) {
 		flush_dcache_range((ulong)buf->buffer,
 				   (ulong)buf->buffer + ALIGN(buf->size, SZ_16K));
 		buf->dva = map_to_sysmem(buf->buffer);
+		rtkit_helper_record_buffer(dev, buf);
 		return 0;
 	}
 
@@ -130,6 +140,9 @@ static int shmem_setup(void *cookie, struct apple_rtkit_buffer *buf) {
 static void shmem_destroy(void *cookie, struct apple_rtkit_buffer *buf) {
 	struct udevice *dev = cookie;
 	struct rtkit_helper_priv *priv = dev_get_priv(dev);
+
+	if (priv->retain_buffers)
+		return;
 
 	/* Firmware keeps OSLog even after QUIESCED and ASC RUN is cleared. */
 	if (!buf->buffer || buf->endpoint == APPLE_RTKIT_EP_OSLOG)
@@ -205,11 +218,27 @@ static int rtkit_helper_remove(struct udevice *dev)
 {
 	struct rtkit_helper_priv *priv = dev_get_priv(dev);
 	u32 ctrl;
+	int ret;
 
-	apple_rtkit_shutdown(priv->rtk, APPLE_RTKIT_PWR_STATE_QUIESCED);
+	if (!priv->rtk)
+		return 0;
+	if (rtkit_helper_uses_dram(dev)) {
+		priv->retain_buffers = true;
+		ret = 0;
+		printf("MTP RTKit: preserving AP/IOP ON; halting CPU for transfer\n");
+		goto halt;
+	}
 
+	ret = apple_rtkit_shutdown(priv->rtk, APPLE_RTKIT_PWR_STATE_QUIESCED);
+	printf("MTP RTKit: shutdown state %#x result %d CPU %#x\n",
+	       APPLE_RTKIT_PWR_STATE_QUIESCED, ret, readl(priv->asc + REG_CPU_CTRL));
+
+halt:
 	ctrl = readl(priv->asc + REG_CPU_CTRL);
 	writel(ctrl & ~REG_CPU_CTRL_RUN, priv->asc + REG_CPU_CTRL);
+	readl(priv->asc + REG_CPU_CTRL);
+	if (ret)
+		return ret;
 
 	apple_rtkit_free(priv->rtk);
 	priv->rtk = NULL;
